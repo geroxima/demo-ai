@@ -2,7 +2,14 @@
 import Link from "next/link";
 import { and, eq } from "drizzle-orm";
 import { db } from "@/lib/db";
-import { contratos, evaluaciones, reclamos } from "@/lib/schema";
+import {
+  contratos,
+  entregas,
+  evaluaciones,
+  observaciones,
+  proveedores,
+  reclamos,
+} from "@/lib/schema";
 import { addAwardExperience } from "./actions";
 import {
   fetchSupplier,
@@ -10,6 +17,7 @@ import {
   searchProcessesBySupplier,
   searchUniAwardedProcesses,
 } from "@/lib/api";
+import { predictSupplierRecommendation } from "@/lib/laya";
 
 export const dynamic = "force-dynamic";
 
@@ -149,9 +157,10 @@ function sanctionsOf(profile: any) {
 
 function rankLabel(score: number | null) {
   if (score === null) return "Datos insuficientes";
-  if (score >= 80) return "Mejor posición simulada";
-  if (score >= 60) return "Revisión adicional";
-  return "Señales de riesgo";
+  if (score >= 85) return "Muy recomendable";
+  if (score >= 70) return "Recomendable";
+  if (score >= 50) return "Revisión adicional";
+  return "Riesgo elevado";
 }
 
 async function assessSupplier(
@@ -204,20 +213,37 @@ async function assessSupplier(
         ]
       : [];
 
+  const localSupplier = db
+    .select()
+    .from(proveedores)
+    .where(eq(proveedores.ruc, supplier.ruc))
+    .get();
+  const savedContracts = db
+    .select()
+    .from(contratos)
+    .where(eq(contratos.proveedorRuc, supplier.ruc))
+    .all();
+  const contractIds = new Set(savedContracts.map((contract) => contract.id));
+  const savedDeliveries = db
+    .select()
+    .from(entregas)
+    .all()
+    .filter((delivery) => contractIds.has(delivery.contratoId));
+  const savedObservations = db
+    .select()
+    .from(observaciones)
+    .where(eq(observaciones.proveedorRuc, supplier.ruc))
+    .all();
+  const savedClaims = db
+    .select()
+    .from(reclamos)
+    .where(eq(reclamos.proveedorRuc, supplier.ruc))
+    .all();
+  const openClaims = savedClaims.filter((claim) => !claim.resuelto);
   const savedEvals = db
     .select()
     .from(evaluaciones)
     .where(eq(evaluaciones.proveedorRuc, supplier.ruc))
-    .all();
-  const openClaims = db
-    .select()
-    .from(reclamos)
-    .where(
-      and(
-        eq(reclamos.proveedorRuc, supplier.ruc),
-        eq(reclamos.resuelto, false),
-      ),
-    )
     .all();
   const evaluationValues = savedEvals
     .flatMap((evaluation) => [
@@ -249,10 +275,129 @@ async function assessSupplier(
       )
     : null;
 
+  const selectedTender = tenderOf(current);
+  const selectedAwards = awardsOf(current).filter((award: any) =>
+    (award?.suppliers || []).some(
+      (item: any) =>
+        String(item?.identifier?.id || item?.id || "").trim() === supplier.ruc,
+    ),
+  );
+  const decisionInput = {
+    supplier: {
+      ruc: supplier.ruc,
+      name: supplier.name,
+      dncp: profile
+        ? {
+            identifier: profile.identifier || null,
+            address: profile.address || null,
+            contactPoint: profile.contactPoint || null,
+            details: profile.details || null,
+          }
+        : null,
+      local: localSupplier
+        ? {
+            razonSocial: localSupplier.razonSocial,
+            nombreComercial: localSupplier.nombreComercial,
+            contacto: localSupplier.contacto,
+            telefono: localSupplier.telefono,
+            email: localSupplier.email,
+            direccion: localSupplier.direccion,
+          }
+        : null,
+    },
+    process: {
+      id: recordKey(current),
+      title: selectedTender.title || selectedTender.id || null,
+      description: selectedTender.description || null,
+      status: selectedTender.statusDetails || selectedTender.status || null,
+      category: selectedTender.mainProcurementCategory || null,
+      procurementMethod: selectedTender.procurementMethodDetails || null,
+      value: selectedTender.value || null,
+      awards: selectedAwards.map((award: any) => ({
+        id: award.id || null,
+        date: award.date || null,
+        status: award.status || award.statusDetails || null,
+        value: award.value || null,
+      })),
+    },
+    evaluations: savedEvals.map((evaluation) => ({
+      fecha: evaluation.fecha,
+      unidadSolicitante: evaluation.unidadSolicitante,
+      calidad: evaluation.calidad,
+      cumplimientoPlazos: evaluation.cumplimientoPlazos,
+      gradoSatisfaccion: evaluation.gradoSatisfaccion,
+      reincidencias: evaluation.reincidencias,
+      notaFinal: evaluation.notaFinal,
+      comentarios: evaluation.comentarios,
+    })),
+    sanctions: {
+      known: sanctions.known,
+      items: sanctions.items,
+    },
+    claims: savedClaims.map((claim) => ({
+      fecha: claim.fecha,
+      tipo: claim.tipo,
+      descripcion: claim.descripcion,
+      resuelto: claim.resuelto,
+      respuesta: claim.respuesta,
+    })),
+    observations: savedObservations.map((observation) => ({
+      fecha: observation.fecha,
+      autor: observation.autor,
+      tipo: observation.tipo,
+      texto: observation.texto,
+    })),
+    contracts: savedContracts.map((contract) => ({
+      llamado: contract.llamado,
+      convocante: contract.convocante,
+      objeto: contract.objeto,
+      fechaFirma: contract.fechaFirma,
+      fechaEntregaPrevista: contract.fechaEntregaPrevista,
+      fechaEntregaReal: contract.fechaEntregaReal,
+      monto: contract.monto,
+      moneda: contract.moneda,
+      estado: contract.estado,
+    })),
+    deliveries: savedDeliveries.map((delivery) => ({
+      fechaEntrega: delivery.fechaEntrega,
+      cumplePlazo: delivery.cumplePlazo,
+      observacion: delivery.observacion,
+    })),
+    previousAwards: pastRecords.map((record: any) => {
+      const tender = tenderOf(record);
+      const awards = awardsOf(record).filter((award: any) =>
+        (award?.suppliers || []).some(
+          (item: any) =>
+            String(item?.identifier?.id || item?.id || "").trim() ===
+            supplier.ruc,
+        ),
+      );
+      return {
+        id: recordKey(record),
+        title: tender.title || tender.id || null,
+        date: dateOf(record) || null,
+        status: tender.statusDetails || tender.status || null,
+        awards: awards.map((award: any) => ({
+          date: award.date || null,
+          value: award.value || null,
+        })),
+      };
+    }),
+  };
+
+  let decisionScore: number | null = null;
+  try {
+    decisionScore = await predictSupplierRecommendation(decisionInput);
+  } catch {
+    // Use the local evidence-based estimate if Laya is unavailable.
+  }
+  const finalScore = decisionScore ?? score;
+
   return {
     ...supplier,
-    score,
-    label: rankLabel(score),
+    score: finalScore,
+    scoreSource: decisionScore === null ? "local" : "laya",
+    label: rankLabel(finalScore),
     evidenceCount: parts.length,
     priorAwards:
       experienceResult.status === "fulfilled" ? pastRecords.length : null,
@@ -342,7 +487,7 @@ export default async function EvaluacionUniPage({
     : [];
   const assessments = selected
     ? await Promise.all(
-        suppliers.map((supplier) => assessSupplier(supplier, selected)),
+        suppliers.map((supplier) => assessSupplier(supplier, selectedFull)),
       )
     : [];
   assessments.sort((a, b) => (b.score ?? -1) - (a.score ?? -1));
@@ -383,6 +528,9 @@ export default async function EvaluacionUniPage({
   );
   const sanctionsAssessedCount = assessments.filter(
     (supplier) => supplier.sanctionsKnown,
+  ).length;
+  const localScoreCount = assessments.filter(
+    (supplier) => supplier.scoreSource === "local",
   ).length;
   const selectedTender = selected ? tenderOf(selectedFull) : null;
   const selectedTitle =
@@ -601,13 +749,20 @@ export default async function EvaluacionUniPage({
                   <p className="uni-eyebrow">COMPARACIÓN DE PROVEEDORES</p>
                   <h3>Orden sugerido</h3>
                 </div>
-                <span>SIMULADO</span>
+                <span>LAYA · IA</span>
               </div>
               <p className="uni-method-note">
-                Puntaje sobre señales disponibles: experiencia previa (40%),
-                evaluaciones D6 (30%) y sanciones (30%). Dimensiones faltantes
-                no se cuentan como evidencia favorable ni desfavorable.
+                Laya puntúa de 0 a 100 usando datos del proveedor, evaluaciones,
+                sanciones, reclamos y antecedentes disponibles. Si Laya no
+                responde, se muestra una estimación local de respaldo.
               </p>
+              {localScoreCount > 0 && (
+                <p className="uni-inline-note" role="status">
+                  No se pudo obtener el puntaje de Laya para {localScoreCount} de{" "}
+                  {assessments.length} proveedores; se ordenan con el cálculo
+                  local de respaldo.
+                </p>
+              )}
               <div className="uni-supplier-list">
                 {supplierRows.map((supplier, index) => (
                   <article className="uni-supplier" key={supplier.ruc}>
@@ -644,6 +799,11 @@ export default async function EvaluacionUniPage({
                     </div>
                     <div className="uni-supplier-signals">
                       <span className="uni-badge">{supplier.label}</span>
+                      <span className="uni-badge">
+                        {supplier.scoreSource === "laya"
+                          ? "Puntaje Laya"
+                          : "Estimación local"}
+                      </span>
                       <span>
                         {supplier.priorAwards === null
                           ? "Proveedor no disponible"
